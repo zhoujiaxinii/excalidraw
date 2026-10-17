@@ -2,6 +2,9 @@
 /// <reference types="vite-plugin-pwa/info" />
 /// <reference types="vite-plugin-svgr/client" />
 interface ImportMetaEnv {
+  VITE_APP_SUPABASE_URL: string;
+  VITE_APP_SUPABASE_PUBLISHABLE_KEY: string;
+
   // The port to run the dev server
   VITE_APP_PORT: string;
 

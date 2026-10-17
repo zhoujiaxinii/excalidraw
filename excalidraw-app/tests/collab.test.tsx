@@ -49,19 +49,18 @@ vi.mock("../../excalidraw-app/data/firebase.ts", () => {
   };
 });
 
-vi.mock("socket.io-client", () => {
-  return {
-    default: () => {
-      return {
-        close: () => {},
-        on: () => {},
-        once: () => {},
-        off: () => {},
-        emit: () => {},
-      };
-    },
-  };
-});
+vi.mock("../collab/SupabaseSocket", () => ({
+  createSupabaseSocket: async () => ({
+    id: "synthetic-socket",
+    connected: false,
+    connect: () => {},
+    close: () => {},
+    on: () => {},
+    once: () => {},
+    off: () => {},
+    emit: () => {},
+  }),
+}));
 
 /**
  * These test would deserve to be extended by testing collab with (at least) two clients simultanouesly,

@@ -1,3 +1,5 @@
+// Kept under its historical filename so the app's existing storage call sites
+// use the owned cloud backend without changing Excalidraw's drawing engine.
 import { reconcileElements } from "@excalidraw/excalidraw";
 import { MIME_TYPES, toBrandedType } from "@excalidraw/common";
 import { decompressData } from "@excalidraw/excalidraw/data/encode";
@@ -7,15 +9,6 @@ import {
 } from "@excalidraw/excalidraw/data/encryption";
 import { restoreElements } from "@excalidraw/excalidraw/data/restore";
 import { getSceneVersion } from "@excalidraw/element";
-import { initializeApp } from "firebase/app";
-import {
-  getFirestore,
-  doc,
-  getDoc,
-  runTransaction,
-  Bytes,
-} from "firebase/firestore";
-import { getStorage, ref, uploadBytes } from "firebase/storage";
 
 import type { RemoteExcalidrawElement } from "@excalidraw/excalidraw/data/reconcile";
 import type {
@@ -30,159 +23,72 @@ import type {
   DataURL,
 } from "@excalidraw/excalidraw/types";
 
-import { FILE_CACHE_MAX_AGE_SEC } from "../app_constants";
+import { appJotaiStore } from "../app-jotai";
+
+import {
+  base64ToBytes,
+  bytesToBase64,
+  CloudRequestError,
+  cloudRequest,
+  parseCloudFilePrefix,
+  readCloudScene,
+  writeCloudScene,
+} from "./cloud";
+import {
+  cloudSaveStateAtom,
+  cloudPendingUploadsAtom,
+  cloudFileErrorAtom,
+} from "./cloudStatus";
 
 import { getSyncableElements } from ".";
 
+import type { CloudScene } from "./cloud";
 import type { SyncableExcalidrawElement } from ".";
 import type Portal from "../collab/Portal";
-import type { Socket } from "socket.io-client";
+import type { CollaborationSocket } from "../collab/CollaborationSocket";
 
-// private
-// -----------------------------------------------------------------------------
+const savedVersions = new WeakMap<CollaborationSocket, number>();
 
-let FIREBASE_CONFIG: Record<string, any>;
-try {
-  FIREBASE_CONFIG = JSON.parse(import.meta.env.VITE_APP_FIREBASE_CONFIG);
-} catch (error: any) {
-  console.warn(
-    `Error JSON parsing firebase config. Supplied value: ${
-      import.meta.env.VITE_APP_FIREBASE_CONFIG
-    }`,
-  );
-  FIREBASE_CONFIG = {};
-}
-
-let firebaseApp: ReturnType<typeof initializeApp> | null = null;
-let firestore: ReturnType<typeof getFirestore> | null = null;
-let firebaseStorage: ReturnType<typeof getStorage> | null = null;
-
-const _initializeFirebase = () => {
-  if (!firebaseApp) {
-    firebaseApp = initializeApp(FIREBASE_CONFIG);
-  }
-  return firebaseApp;
-};
-
-const _getFirestore = () => {
-  if (!firestore) {
-    firestore = getFirestore(_initializeFirebase());
-  }
-  return firestore;
-};
-
-const _getStorage = () => {
-  if (!firebaseStorage) {
-    firebaseStorage = getStorage(_initializeFirebase());
-  }
-  return firebaseStorage;
-};
-
-// -----------------------------------------------------------------------------
-
-export const loadFirebaseStorage = async () => {
-  return _getStorage();
-};
-
-type FirebaseStoredScene = {
-  sceneVersion: number;
-  iv: Bytes;
-  ciphertext: Bytes;
+// Excalidraw+ is a separate service; this self-hosted deployment does not export
+// user documents to the upstream provider's Firebase account.
+export const loadFirebaseStorage = async (): Promise<never> => {
+  throw new Error("Excalidraw+ export is not enabled on this deployment.");
 };
 
 const encryptElements = async (
   key: string,
   elements: readonly ExcalidrawElement[],
-): Promise<{ ciphertext: ArrayBuffer; iv: Uint8Array }> => {
-  const json = JSON.stringify(elements);
-  const encoded = new TextEncoder().encode(json);
-  const { encryptedBuffer, iv } = await encryptData(key, encoded);
-
-  return { ciphertext: encryptedBuffer, iv };
-};
-
-const decryptElements = async (
-  data: FirebaseStoredScene,
-  roomKey: string,
-): Promise<readonly ExcalidrawElement[]> => {
-  const ciphertext = data.ciphertext.toUint8Array() as Uint8Array<ArrayBuffer>;
-  const iv = data.iv.toUint8Array() as Uint8Array<ArrayBuffer>;
-
-  const decrypted = await decryptData(iv, ciphertext, roomKey);
-  const decodedData = new TextDecoder("utf-8").decode(
-    new Uint8Array(decrypted),
+): Promise<Omit<CloudScene, "revision">> => {
+  const { encryptedBuffer, iv } = await encryptData(
+    key,
+    new TextEncoder().encode(JSON.stringify(elements)),
   );
-  return JSON.parse(decodedData);
+  return {
+    sceneVersion: getSceneVersion(elements),
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(new Uint8Array(encryptedBuffer)),
+  };
 };
 
-class FirebaseSceneVersionCache {
-  private static cache = new WeakMap<Socket, number>();
-  static get = (socket: Socket) => {
-    return FirebaseSceneVersionCache.cache.get(socket);
-  };
-  static set = (
-    socket: Socket,
-    elements: readonly SyncableExcalidrawElement[],
-  ) => {
-    FirebaseSceneVersionCache.cache.set(socket, getSceneVersion(elements));
-  };
-}
+const decryptElements = async (scene: CloudScene, key: string) => {
+  const plaintext = await decryptData(
+    base64ToBytes(scene.iv),
+    base64ToBytes(scene.ciphertext),
+    key,
+  );
+  return getSyncableElements(
+    restoreElements(JSON.parse(new TextDecoder().decode(plaintext)), null),
+  );
+};
 
 export const isSavedToFirebase = (
   portal: Portal,
   elements: readonly ExcalidrawElement[],
-): boolean => {
-  if (portal.socket && portal.roomId && portal.roomKey) {
-    const sceneVersion = getSceneVersion(elements);
-
-    return FirebaseSceneVersionCache.get(portal.socket) === sceneVersion;
-  }
-  // if no room exists, consider the room saved so that we don't unnecessarily
-  // prevent unload (there's nothing we could do at that point anyway)
-  return true;
-};
-
-export const saveFilesToFirebase = async ({
-  prefix,
-  files,
-}: {
-  prefix: string;
-  files: { id: FileId; buffer: Uint8Array }[];
-}) => {
-  const storage = await loadFirebaseStorage();
-
-  const erroredFiles: FileId[] = [];
-  const savedFiles: FileId[] = [];
-
-  await Promise.all(
-    files.map(async ({ id, buffer }) => {
-      try {
-        const storageRef = ref(storage, `${prefix}/${id}`);
-        await uploadBytes(storageRef, buffer, {
-          cacheControl: `public, max-age=${FILE_CACHE_MAX_AGE_SEC}`,
-        });
-        savedFiles.push(id);
-      } catch (error: any) {
-        erroredFiles.push(id);
-      }
-    }),
-  );
-
-  return { savedFiles, erroredFiles };
-};
-
-const createFirebaseSceneDocument = async (
-  elements: readonly SyncableExcalidrawElement[],
-  roomKey: string,
-) => {
-  const sceneVersion = getSceneVersion(elements);
-  const { ciphertext, iv } = await encryptElements(roomKey, elements);
-  return {
-    sceneVersion,
-    ciphertext: Bytes.fromUint8Array(new Uint8Array(ciphertext)),
-    iv: Bytes.fromUint8Array(iv),
-  } as FirebaseStoredScene;
-};
+) =>
+  !portal.socket ||
+  !portal.roomId ||
+  !portal.roomKey ||
+  savedVersions.get(portal.socket) === getSceneVersion(elements);
 
 export const saveToFirebase = async (
   portal: Portal,
@@ -190,130 +96,209 @@ export const saveToFirebase = async (
   appState: AppState,
 ) => {
   const { roomId, roomKey, socket } = portal;
-  if (
-    // bail if no room exists as there's nothing we can do at this point
-    !roomId ||
-    !roomKey ||
-    !socket ||
-    isSavedToFirebase(portal, elements)
-  ) {
+  if (!roomId || !roomKey || !socket || isSavedToFirebase(portal, elements)) {
     return null;
   }
-
-  const firestore = _getFirestore();
-  const docRef = doc(firestore, "scenes", roomId);
-
-  const storedScene = await runTransaction(firestore, async (transaction) => {
-    const snapshot = await transaction.get(docRef);
-
-    if (!snapshot.exists()) {
-      const storedScene = await createFirebaseSceneDocument(elements, roomKey);
-
-      transaction.set(docRef, storedScene);
-
-      return storedScene;
+  appJotaiStore.set(cloudSaveStateAtom, "saving");
+  try {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      let previous: CloudScene | null = null;
+      try {
+        previous = await readCloudScene(roomId, roomKey);
+      } catch (error) {
+        // Missing and inaccessible rooms intentionally share the same status.
+        // A create attempt can initialize a missing room, but never overwrite
+        // an existing room owned by another capability.
+        if (!(error instanceof CloudRequestError && error.status === 403)) {
+          throw error;
+        }
+      }
+      const reconciled = previous
+        ? getSyncableElements(
+            reconcileElements(
+              elements,
+              (await decryptElements(
+                previous,
+                roomKey,
+              )) as OrderedExcalidrawElement[] as RemoteExcalidrawElement[],
+              appState,
+            ),
+          )
+        : elements;
+      try {
+        const stored = await writeCloudScene(
+          roomId,
+          roomKey,
+          await encryptElements(roomKey, reconciled),
+          previous?.revision ?? null,
+        );
+        const storedElements = await decryptElements(stored, roomKey);
+        savedVersions.set(socket, getSceneVersion(storedElements));
+        if (portal.socket === socket && portal.roomId === roomId) {
+          appJotaiStore.set(
+            cloudSaveStateAtom,
+            isSavedToFirebase(
+              portal,
+              portal.collab.getSceneElementsIncludingDeleted(),
+            )
+              ? "saved"
+              : "saving",
+          );
+        }
+        return toBrandedType<RemoteExcalidrawElement[]>(storedElements);
+      } catch (error) {
+        if (!(error instanceof CloudRequestError && error.status === 409)) {
+          throw error;
+        }
+      }
     }
-
-    const prevStoredScene = snapshot.data() as FirebaseStoredScene;
-    const prevStoredElements = getSyncableElements(
-      restoreElements(await decryptElements(prevStoredScene, roomKey), null),
+    throw new Error(
+      "The drawing changed while saving. Please retry once collaborators finish their current edit.",
     );
-    const reconciledElements = getSyncableElements(
-      reconcileElements(
-        elements,
-        prevStoredElements as OrderedExcalidrawElement[] as RemoteExcalidrawElement[],
-        appState,
-      ),
-    );
-
-    const storedScene = await createFirebaseSceneDocument(
-      reconciledElements,
-      roomKey,
-    );
-
-    transaction.update(docRef, storedScene);
-
-    // Return the stored elements as the in memory `reconciledElements` could have mutated in the meantime
-    return storedScene;
-  });
-
-  const storedElements = getSyncableElements(
-    restoreElements(await decryptElements(storedScene, roomKey), null),
-  );
-
-  FirebaseSceneVersionCache.set(socket, storedElements);
-
-  return toBrandedType<RemoteExcalidrawElement[]>(storedElements);
+  } catch (error) {
+    if (portal.socket === socket && portal.roomId === roomId) {
+      appJotaiStore.set(cloudSaveStateAtom, "error");
+    }
+    throw error;
+  }
 };
 
 export const loadFromFirebase = async (
   roomId: string,
   roomKey: string,
-  socket: Socket | null,
+  socket: CollaborationSocket | null,
 ): Promise<readonly SyncableExcalidrawElement[] | null> => {
-  const firestore = _getFirestore();
-  const docRef = doc(firestore, "scenes", roomId);
-  const docSnap = await getDoc(docRef);
-  if (!docSnap.exists()) {
+  const scene = await readCloudScene(roomId, roomKey);
+  if (!scene) {
     return null;
   }
-  const storedScene = docSnap.data() as FirebaseStoredScene;
-  const elements = getSyncableElements(
-    restoreElements(await decryptElements(storedScene, roomKey), null, {
-      deleteInvisibleElements: true,
-    }),
-  );
-
+  const elements = await decryptElements(scene, roomKey);
   if (socket) {
-    FirebaseSceneVersionCache.set(socket, elements);
+    savedVersions.set(socket, getSceneVersion(elements));
   }
-
   return elements;
+};
+
+export const saveFilesToFirebase = async ({
+  prefix,
+  files,
+  encryptionKey,
+  isCurrentRoom,
+}: {
+  prefix: string;
+  files: { id: FileId; buffer: Uint8Array }[];
+  encryptionKey?: string;
+  isCurrentRoom?: () => boolean;
+}) => {
+  if (!encryptionKey) {
+    throw new Error("Cloud file uploads require the drawing's complete link.");
+  }
+  const { kind, id } = parseCloudFilePrefix(prefix);
+  const savedFiles: FileId[] = [];
+  const erroredFiles: FileId[] = [];
+  if (isCurrentRoom?.()) {
+    appJotaiStore.set(cloudPendingUploadsAtom, (count) => count + files.length);
+    if (files.length) {
+      appJotaiStore.set(cloudFileErrorAtom, false);
+    }
+  }
+  // Sequential uploads avoid unexpectedly exhausting a free project's burst
+  // capacity when a large drawing contains many images.
+  for (const file of files) {
+    try {
+      let verifyExisting = false;
+      try {
+        const response = await cloudRequest(
+          kind,
+          id,
+          encryptionKey,
+          `/files/${kind}/${id}/${file.id}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/octet-stream" },
+            body: new Uint8Array(file.buffer),
+          },
+        );
+        verifyExisting = response.status === 200;
+      } catch (error) {
+        if (!(error instanceof CloudRequestError && error.status === 409)) {
+          throw error;
+        }
+        verifyExisting = true;
+      }
+      if (verifyExisting) {
+        const existing = await cloudRequest(
+          kind,
+          id,
+          encryptionKey,
+          `/files/${kind}/${id}/${file.id}`,
+        );
+        const [actual, expected] = await Promise.all([
+          decompressData<BinaryFileMetadata>(
+            new Uint8Array(await existing.arrayBuffer()),
+            { decryptionKey: encryptionKey },
+          ),
+          decompressData<BinaryFileMetadata>(new Uint8Array(file.buffer), {
+            decryptionKey: encryptionKey,
+          }),
+        ]);
+        if (
+          actual.metadata.mimeType !== expected.metadata.mimeType ||
+          actual.data.length !== expected.data.length ||
+          !actual.data.every((byte, index) => byte === expected.data[index])
+        ) {
+          throw new Error(
+            "The stored image does not match this drawing's image.",
+          );
+        }
+      }
+      savedFiles.push(file.id);
+    } catch {
+      erroredFiles.push(file.id);
+      if (isCurrentRoom?.()) {
+        appJotaiStore.set(cloudFileErrorAtom, true);
+      }
+    } finally {
+      if (isCurrentRoom?.()) {
+        appJotaiStore.set(cloudPendingUploadsAtom, (count) =>
+          Math.max(0, count - 1),
+        );
+      }
+    }
+  }
+  return { savedFiles, erroredFiles };
 };
 
 export const loadFilesFromFirebase = async (
   prefix: string,
   decryptionKey: string,
-  filesIds: readonly FileId[],
+  fileIds: readonly FileId[],
 ) => {
+  const { kind, id } = parseCloudFilePrefix(prefix);
   const loadedFiles: BinaryFileData[] = [];
   const erroredFiles = new Map<FileId, true>();
-
-  await Promise.all(
-    [...new Set(filesIds)].map(async (id) => {
-      try {
-        const url = `https://firebasestorage.googleapis.com/v0/b/${
-          FIREBASE_CONFIG.storageBucket
-        }/o/${encodeURIComponent(prefix.replace(/^\//, ""))}%2F${id}`;
-        const response = await fetch(`${url}?alt=media`);
-        if (response.status < 400) {
-          const arrayBuffer = await response.arrayBuffer();
-
-          const { data, metadata } = await decompressData<BinaryFileMetadata>(
-            new Uint8Array(arrayBuffer),
-            {
-              decryptionKey,
-            },
-          );
-
-          const dataURL = new TextDecoder().decode(data) as DataURL;
-
-          loadedFiles.push({
-            mimeType: metadata.mimeType || MIME_TYPES.binary,
-            id,
-            dataURL,
-            created: metadata?.created || Date.now(),
-            lastRetrieved: metadata?.created || Date.now(),
-          });
-        } else {
-          erroredFiles.set(id, true);
-        }
-      } catch (error: any) {
-        erroredFiles.set(id, true);
-        console.error(error);
-      }
-    }),
-  );
-
+  for (const fileId of new Set(fileIds)) {
+    try {
+      const response = await cloudRequest(
+        kind,
+        id,
+        decryptionKey,
+        `/files/${kind}/${id}/${fileId}`,
+      );
+      const { data, metadata } = await decompressData<BinaryFileMetadata>(
+        new Uint8Array(await response.arrayBuffer()),
+        { decryptionKey },
+      );
+      loadedFiles.push({
+        id: fileId,
+        mimeType: metadata.mimeType || MIME_TYPES.binary,
+        dataURL: new TextDecoder().decode(data) as DataURL,
+        created: metadata.created || Date.now(),
+        lastRetrieved: Date.now(),
+      });
+    } catch {
+      erroredFiles.set(fileId, true);
+    }
+  }
   return { loadedFiles, erroredFiles };
 };

@@ -37,6 +37,7 @@ import {
 
 import { encodeFilesForUpload } from "./FileManager";
 import { saveFilesToFirebase } from "./firebase";
+import { createCloudSnapshot, loadCloudSnapshot } from "./cloud";
 
 import type { WS_SUBTYPES } from "../app_constants";
 
@@ -61,9 +62,6 @@ export const getSyncableElements = (
   elements.filter((element) =>
     isSyncableElement(element),
   ) as SyncableExcalidrawElement[];
-
-const BACKEND_V2_GET = import.meta.env.VITE_APP_BACKEND_V2_GET_URL;
-const BACKEND_V2_POST = import.meta.env.VITE_APP_BACKEND_V2_POST_URL;
 
 const generateRoomId = async () => {
   const buffer = new Uint8Array(ROOM_ID_BYTES);
@@ -204,13 +202,7 @@ export const importFromBackend = async (
   decryptionKey: string,
 ): Promise<ImportedDataState> => {
   try {
-    const response = await fetch(`${BACKEND_V2_GET}${id}`);
-
-    if (!response.ok) {
-      window.alert(t("alerts.importBackendFailed"));
-      return {};
-    }
-    const buffer = await response.arrayBuffer();
+    const buffer = await loadCloudSnapshot(id, decryptionKey);
 
     try {
       const { data: decodedBuffer } = await decompressData(
@@ -273,11 +265,13 @@ export const exportToBackend = async (
       maxBytes: FILE_UPLOAD_MAX_BYTES,
     });
 
-    const response = await fetch(BACKEND_V2_POST, {
-      method: "POST",
-      body: payload.buffer,
-    });
-    const json = await response.json();
+    const id = await generateRoomId();
+    await createCloudSnapshot(
+      id,
+      encryptionKey,
+      new Uint8Array(payload.buffer),
+    );
+    const json = { id };
     if (json.id) {
       const url = new URL(window.location.href);
       // We need to store the key (and less importantly the id) as hash instead
@@ -285,17 +279,18 @@ export const exportToBackend = async (
       url.hash = `json=${json.id},${encryptionKey}`;
       const urlString = url.toString();
 
-      await saveFilesToFirebase({
+      const { erroredFiles } = await saveFilesToFirebase({
         prefix: `/files/shareLinks/${json.id}`,
         files: filesToUpload,
+        encryptionKey,
       });
+      if (erroredFiles.length) {
+        throw new Error(
+          "Some images could not be saved. Please retry creating the sharing link.",
+        );
+      }
 
       return { url: urlString, errorMessage: null };
-    } else if (json.error_class === "RequestTooLargeError") {
-      return {
-        url: null,
-        errorMessage: t("alerts.couldNotCreateShareableLinkTooBig"),
-      };
     }
 
     return { url: null, errorMessage: t("alerts.couldNotCreateShareableLink") };

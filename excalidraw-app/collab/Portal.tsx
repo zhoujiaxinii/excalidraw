@@ -20,11 +20,11 @@ import type {
   SyncableExcalidrawElement,
 } from "../data";
 import type { TCollabClass } from "./Collab";
-import type { Socket } from "socket.io-client";
+import type { CollaborationSocket } from "./CollaborationSocket";
 
 class Portal {
   collab: TCollabClass;
-  socket: Socket | null = null;
+  socket: CollaborationSocket | null = null;
   socketInitialized: boolean = false; // we don't want the socket to emit any updates until it is fully initialized
   roomId: string | null = null;
   roomKey: string | null = null;
@@ -34,7 +34,7 @@ class Portal {
     this.collab = collab;
   }
 
-  open(socket: Socket, id: string, key: string) {
+  open(socket: CollaborationSocket, id: string, key: string) {
     this.socket = socket;
     this.roomId = id;
     this.roomKey = key;
@@ -65,6 +65,7 @@ class Portal {
       return;
     }
     this.queueFileUpload.flush();
+    this.queueFileUpload.cancel();
     this.socket.close();
     this.socket = null;
     this.roomId = null;
@@ -76,7 +77,7 @@ class Portal {
   isOpen() {
     return !!(
       this.socketInitialized &&
-      this.socket &&
+      this.socket?.connected &&
       this.roomId &&
       this.roomKey
     );
@@ -88,13 +89,20 @@ class Portal {
     roomId?: string,
   ) {
     if (this.isOpen()) {
+      const { socket, roomId: currentRoomId, roomKey } = this;
       const json = JSON.stringify(data);
       const encoded = new TextEncoder().encode(json);
-      const { encryptedBuffer, iv } = await encryptData(this.roomKey!, encoded);
-
-      this.socket?.emit(
+      const { encryptedBuffer, iv } = await encryptData(roomKey!, encoded);
+      if (
+        this.socket !== socket ||
+        this.roomKey !== roomKey ||
+        !this.isOpen()
+      ) {
+        return;
+      }
+      socket?.emit(
         volatile ? WS_EVENTS.SERVER_VOLATILE : WS_EVENTS.SERVER,
-        roomId ?? this.roomId,
+        roomId ?? currentRoomId,
         encryptedBuffer,
         iv,
       );
@@ -102,13 +110,14 @@ class Portal {
   }
 
   queueFileUpload = throttle(async () => {
+    const socket = this.socket;
     try {
       await this.collab.fileManager.saveFiles({
         elements: this.collab.excalidrawAPI.getSceneElementsIncludingDeleted(),
         files: this.collab.excalidrawAPI.getFiles(),
       });
     } catch (error: any) {
-      if (error.name !== "AbortError") {
+      if (this.socket === socket && error.name !== "AbortError") {
         this.collab.excalidrawAPI.updateScene({
           appState: {
             errorMessage: error.message,
@@ -117,6 +126,9 @@ class Portal {
       }
     }
 
+    if (this.socket !== socket) {
+      return;
+    }
     let isChanged = false;
     const newElements = this.collab.excalidrawAPI
       .getSceneElementsIncludingDeleted()
