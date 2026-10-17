@@ -89,6 +89,11 @@ export const cloudRequest = async (
   const token = await getRoomAccessToken(kind, id, encryptionKey);
   const headers = new Headers(init.headers);
   headers.set("apikey", publishableKey);
+  // Keep the storage function beside its database; encrypted scenes can be
+  // several MiB and should not cross oceans between the function and Postgres.
+  if (import.meta.env.VITE_APP_SUPABASE_REGION) {
+    headers.set("x-region", import.meta.env.VITE_APP_SUPABASE_REGION);
+  }
   headers.set("x-excalidraw-token", token);
   const response = await fetch(
     `${cloudUrl}/functions/v1/excalidraw-cloud${path}`,

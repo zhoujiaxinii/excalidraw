@@ -219,6 +219,11 @@ Deno.test("CORS permits exact production/local origins and apikey preflight", as
     );
     const response = await handle(req);
     equal(response.status, 204);
+    assert(
+      response.headers.get("Access-Control-Allow-Headers")?.includes(
+        "x-region",
+      ),
+    );
     equal(response.headers.get("access-control-allow-origin"), allowed);
     assert(
       response.headers.get("access-control-allow-headers")?.includes("apikey"),

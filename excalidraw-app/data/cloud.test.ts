@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   base64ToBytes,
@@ -36,5 +36,35 @@ describe("cloud capability helpers", () => {
     expect(() =>
       parseCloudFilePrefix("/migrations/files/0123456789abcdef0123"),
     ).toThrow();
+  });
+});
+
+describe("cloud region routing", () => {
+  it("sends the configured database-region hint on storage requests", async () => {
+    vi.stubEnv("VITE_APP_SUPABASE_URL", "https://example.supabase.co");
+    vi.stubEnv("VITE_APP_SUPABASE_PUBLISHABLE_KEY", "sb_publishable_synthetic");
+    vi.stubEnv("VITE_APP_SUPABASE_REGION", "ap-southeast-1");
+    const fetcher = vi.fn(
+      async (_url: string, _options: RequestInit) =>
+        new Response("{}", { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    try {
+      vi.resetModules();
+      const { cloudRequest } = await import("./cloud");
+      await cloudRequest(
+        "rooms",
+        "0123456789abcdef0123",
+        "synthetic-key",
+        "/rooms/0123456789abcdef0123",
+      );
+      const options = fetcher.mock.calls[0][1] as RequestInit;
+      expect(new Headers(options.headers).get("x-region")).toBe(
+        "ap-southeast-1",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
   });
 });

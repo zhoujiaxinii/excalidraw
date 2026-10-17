@@ -260,7 +260,7 @@ export function createHandler(
       headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
       headers.set(
         "Access-Control-Allow-Headers",
-        "content-type, x-excalidraw-token, apikey",
+        "content-type, x-excalidraw-token, apikey, x-region",
       );
       headers.set("Access-Control-Expose-Headers", "Retry-After");
       headers.set("Access-Control-Max-Age", "600");
