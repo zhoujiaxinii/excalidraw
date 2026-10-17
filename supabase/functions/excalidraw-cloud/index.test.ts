@@ -447,3 +447,52 @@ Deno.test("unknown fields, query strings, encodings and MIME types fail closed",
     400,
   );
 });
+
+Deno.test("compact committed writes reconstruct the unchanged browser response", async () => {
+  for (const [method, status] of [["POST", 201], ["PUT", 200]] as const) {
+    const large = {
+      ...payload,
+      ciphertext: bytesToBase64(new Uint8Array(MAX_BINARY_BYTES).fill(9)),
+    };
+    const handle = createHandler(backend({
+      rpc: async () => ({
+        status,
+        writeAck: { revision: 3, sceneVersion: large.sceneVersion },
+      }),
+    }));
+    const response = await handle(
+      request(
+        `/rooms/${id}`,
+        method,
+        JSON.stringify(
+          method === "PUT" ? { ...large, expectedRevision: 2 } : large,
+        ),
+      ),
+    );
+    equal(response.status, status);
+    equal(await response.json(), { revision: 3, ...large });
+  }
+});
+
+Deno.test("conflicts never echo the uncommitted caller payload", async () => {
+  const handle = createHandler(
+    backend({ rpc: async () => ({ status: 409, record }) }),
+  );
+  const changed = {
+    ...payload,
+    ciphertext: bytesToBase64(new Uint8Array(16).fill(7)),
+  };
+  for (const method of ["POST", "PUT"]) {
+    const response = await handle(
+      request(
+        `/rooms/${id}`,
+        method,
+        JSON.stringify(
+          method === "PUT" ? { ...changed, expectedRevision: 2 } : changed,
+        ),
+      ),
+    );
+    equal(response.status, 409);
+    equal(await response.json(), record);
+  }
+});

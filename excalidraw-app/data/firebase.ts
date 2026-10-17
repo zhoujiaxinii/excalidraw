@@ -1,7 +1,7 @@
 // Kept under its historical filename so the app's existing storage call sites
 // use the owned cloud backend without changing Excalidraw's drawing engine.
 import { reconcileElements } from "@excalidraw/excalidraw";
-import { MIME_TYPES, toBrandedType } from "@excalidraw/common";
+import { cloneJSON, MIME_TYPES, toBrandedType } from "@excalidraw/common";
 import { decompressData } from "@excalidraw/excalidraw/data/encode";
 import {
   encryptData,
@@ -39,6 +39,7 @@ import {
   cloudPendingUploadsAtom,
   cloudFileErrorAtom,
 } from "./cloudStatus";
+import { CoalescingSaveQueue } from "./CoalescingSaveQueue";
 
 import { getSyncableElements } from ".";
 
@@ -47,7 +48,39 @@ import type { SyncableExcalidrawElement } from ".";
 import type Portal from "../collab/Portal";
 import type { CollaborationSocket } from "../collab/CollaborationSocket";
 
-const savedVersions = new WeakMap<CollaborationSocket, number>();
+type SavedScene = {
+  version: number;
+  inputVersion: number;
+  elements: readonly SyncableExcalidrawElement[];
+};
+const savedScenes = new WeakMap<CollaborationSocket, Map<string, SavedScene>>();
+const roomScope = (roomId: string, roomKey: string) => `${roomId}:${roomKey}`;
+
+const rememberSavedScene = (
+  socket: CollaborationSocket,
+  scope: string,
+  elements: readonly SyncableExcalidrawElement[],
+  inputVersion: number,
+) => {
+  let rooms = savedScenes.get(socket);
+  if (!rooms) {
+    rooms = new Map();
+    savedScenes.set(socket, rooms);
+  }
+  rooms.set(scope, {
+    version: getSceneVersion(elements),
+    inputVersion,
+    elements,
+  });
+};
+
+type SceneSave = {
+  roomId: string;
+  roomKey: string;
+  socket: CollaborationSocket;
+  elements: readonly SyncableExcalidrawElement[];
+  appState: AppState;
+};
 
 // Excalidraw+ is a separate service; this self-hosted deployment does not export
 // user documents to the upstream provider's Firebase account.
@@ -81,14 +114,82 @@ const decryptElements = async (scene: CloudScene, key: string) => {
   );
 };
 
+const saveScene = async ({
+  roomId,
+  roomKey,
+  socket,
+  elements,
+  appState,
+}: SceneSave) => {
+  const scope = roomScope(roomId, roomKey);
+  const inputVersion = getSceneVersion(elements);
+  const saved = savedScenes.get(socket)?.get(scope);
+  if (saved?.version === inputVersion || saved?.inputVersion === inputVersion) {
+    // A duplicate request queued during the previous save needs its reconciled
+    // result, but does not need another GET/encrypt/PUT cycle.
+    return toBrandedType<readonly RemoteExcalidrawElement[]>(saved.elements);
+  }
+  for (let attempt = 0; attempt < 6; attempt++) {
+    let previous: CloudScene | null = null;
+    try {
+      previous = await readCloudScene(roomId, roomKey);
+    } catch (error) {
+      // Missing and inaccessible rooms intentionally share the same status.
+      // A create attempt can initialize a missing room, but never overwrite
+      // an existing room owned by another capability.
+      if (!(error instanceof CloudRequestError && error.status === 403)) {
+        throw error;
+      }
+    }
+    const reconciled = previous
+      ? getSyncableElements(
+          reconcileElements(
+            elements,
+            (await decryptElements(
+              previous,
+              roomKey,
+            )) as OrderedExcalidrawElement[] as RemoteExcalidrawElement[],
+            appState,
+          ),
+        )
+      : elements;
+    try {
+      const stored = await writeCloudScene(
+        roomId,
+        roomKey,
+        await encryptElements(roomKey, reconciled),
+        previous?.revision ?? null,
+      );
+      const storedElements = await decryptElements(stored, roomKey);
+      rememberSavedScene(socket, scope, storedElements, inputVersion);
+      return toBrandedType<readonly RemoteExcalidrawElement[]>(storedElements);
+    } catch (error) {
+      if (!(error instanceof CloudRequestError && error.status === 409)) {
+        throw error;
+      }
+    }
+  }
+  throw new Error(
+    "The drawing changed while saving. Please retry once collaborators finish their current edit.",
+  );
+};
+
+const sceneSaveQueue = new CoalescingSaveQueue(saveScene);
+
 export const isSavedToFirebase = (
   portal: Portal,
   elements: readonly ExcalidrawElement[],
-) =>
-  !portal.socket ||
-  !portal.roomId ||
-  !portal.roomKey ||
-  savedVersions.get(portal.socket) === getSceneVersion(elements);
+) => {
+  const { socket, roomId, roomKey } = portal;
+  if (!socket || !roomId || !roomKey) {
+    return true;
+  }
+  const scope = roomScope(roomId, roomKey);
+  return (
+    !sceneSaveQueue.isBusy(socket, scope) &&
+    savedScenes.get(socket)?.get(scope)?.version === getSceneVersion(elements)
+  );
+};
 
 export const saveToFirebase = async (
   portal: Portal,
@@ -99,66 +200,43 @@ export const saveToFirebase = async (
   if (!roomId || !roomKey || !socket || isSavedToFirebase(portal, elements)) {
     return null;
   }
+  const isCurrentRoom = () =>
+    portal.socket === socket &&
+    portal.roomId === roomId &&
+    portal.roomKey === roomKey;
   appJotaiStore.set(cloudSaveStateAtom, "saving");
   try {
-    for (let attempt = 0; attempt < 6; attempt++) {
-      let previous: CloudScene | null = null;
-      try {
-        previous = await readCloudScene(roomId, roomKey);
-      } catch (error) {
-        // Missing and inaccessible rooms intentionally share the same status.
-        // A create attempt can initialize a missing room, but never overwrite
-        // an existing room owned by another capability.
-        if (!(error instanceof CloudRequestError && error.status === 403)) {
-          throw error;
-        }
-      }
-      const reconciled = previous
-        ? getSyncableElements(
-            reconcileElements(
-              elements,
-              (await decryptElements(
-                previous,
-                roomKey,
-              )) as OrderedExcalidrawElement[] as RemoteExcalidrawElement[],
-              appState,
-            ),
-          )
-        : elements;
-      try {
-        const stored = await writeCloudScene(
-          roomId,
-          roomKey,
-          await encryptElements(roomKey, reconciled),
-          previous?.revision ?? null,
-        );
-        const storedElements = await decryptElements(stored, roomKey);
-        savedVersions.set(socket, getSceneVersion(storedElements));
-        if (portal.socket === socket && portal.roomId === roomId) {
-          appJotaiStore.set(
-            cloudSaveStateAtom,
-            isSavedToFirebase(
-              portal,
-              portal.collab.getSceneElementsIncludingDeleted(),
-            )
-              ? "saved"
-              : "saving",
-          );
-        }
-        return toBrandedType<RemoteExcalidrawElement[]>(storedElements);
-      } catch (error) {
-        if (!(error instanceof CloudRequestError && error.status === 409)) {
-          throw error;
-        }
-      }
-    }
-    throw new Error(
-      "The drawing changed while saving. Please retry once collaborators finish their current edit.",
+    const storedElements = await sceneSaveQueue.enqueue(
+      socket,
+      roomScope(roomId, roomKey),
+      {
+        roomId,
+        roomKey,
+        socket,
+        // Image-upload callers can pass live, mutable elements. Capture the
+        // requested scene before waiting for an earlier save to finish.
+        elements: cloneJSON(elements),
+        appState: { ...appState },
+      },
     );
-  } catch (error) {
-    if (portal.socket === socket && portal.roomId === roomId) {
-      appJotaiStore.set(cloudSaveStateAtom, "error");
+    if (!isCurrentRoom()) {
+      return null;
     }
+    appJotaiStore.set(
+      cloudSaveStateAtom,
+      isSavedToFirebase(
+        portal,
+        getSyncableElements(portal.collab.getSceneElementsIncludingDeleted()),
+      )
+        ? "saved"
+        : "saving",
+    );
+    return storedElements;
+  } catch (error) {
+    if (!isCurrentRoom()) {
+      return null;
+    }
+    appJotaiStore.set(cloudSaveStateAtom, "error");
     throw error;
   }
 };
@@ -174,7 +252,12 @@ export const loadFromFirebase = async (
   }
   const elements = await decryptElements(scene, roomKey);
   if (socket) {
-    savedVersions.set(socket, getSceneVersion(elements));
+    rememberSavedScene(
+      socket,
+      roomScope(roomId, roomKey),
+      elements,
+      getSceneVersion(elements),
+    );
   }
   return elements;
 };

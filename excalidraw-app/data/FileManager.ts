@@ -114,6 +114,15 @@ export class FileManager {
       }
     }
 
+    // Scene broadcasts also check for image uploads. With no new files, do not
+    // invoke the backend callback (which first persists the room's scene).
+    if (!addedFiles.size) {
+      return {
+        savedFiles: new Map<FileId, BinaryFileData>(),
+        erroredFiles: new Map<FileId, BinaryFileData>(),
+      };
+    }
+
     try {
       const { savedFiles, erroredFiles } = await this._saveFiles({
         addedFiles,

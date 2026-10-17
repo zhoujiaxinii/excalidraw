@@ -39,6 +39,7 @@ export type SceneRecord = {
 type RpcResult = {
   status: number;
   record?: SceneRecord;
+  writeAck?: { revision: number; sceneVersion: number };
   retryAfter?: number;
   byteSize?: number;
 };
@@ -439,9 +440,27 @@ export function createHandler(
       if (result.status !== 200 && result.status !== 201) {
         return failure(result);
       }
-      return route.kind === "shareLinks"
-        ? json({ id: route.id }, result.status)
-        : json(result.record, result.status);
+      if (route.kind === "shareLinks") {
+        return json({ id: route.id }, result.status);
+      }
+      // Successful writes need not echo megabytes through PostgREST while its
+      // transaction still owns the global budget lock. Rebuild the unchanged
+      // browser response only after the small committed acknowledgement arrives.
+      // Full records remain accepted for a safe rolling backend migration.
+      const stored = result.writeAck
+        ? {
+          revision: result.writeAck.revision,
+          sceneVersion: result.writeAck.sceneVersion,
+          iv: payload.iv,
+          ciphertext: payload.ciphertext,
+        }
+        : result.record;
+      if (
+        !stored || !Number.isSafeInteger(stored.revision) ||
+        stored.revision < 1 ||
+        stored.sceneVersion !== payload.sceneVersion
+      ) throw new Error("Invalid write acknowledgement");
+      return json(stored, result.status);
     } catch (error) {
       if (error instanceof HttpError) {
         return json({ error: error.message }, error.status);

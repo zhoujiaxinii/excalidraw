@@ -3,7 +3,7 @@
  * PGLITE_MODULE=/tmp/excalidraw-sql-tests/node_modules/@electric-sql/pglite/dist/index.js node supabase/functions/excalidraw-cloud/sql-invariants.test.mjs
  */
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 const { PGlite } = await import(process.env.PGLITE_MODULE || "@electric-sql/pglite");
 const db = new PGlite();
 let checks = 0;
@@ -15,8 +15,10 @@ await db.exec(`
   create schema storage;
   create table storage.buckets(id text primary key, name text, public boolean, file_size_limit bigint, allowed_mime_types text[]);
 `);
-const migration = await readFile(new URL("../../migrations/20261017021921_encrypted_excalidraw_storage.sql", import.meta.url), "utf8");
-await db.exec(migration);
+const migrations = new URL("../../migrations/", import.meta.url);
+for (const name of (await readdir(migrations)).filter((name) => name.endsWith(".sql")).sort()) {
+  await db.exec(await readFile(new URL(name, migrations), "utf8"));
+}
 const hash = "a".repeat(64);
 const wrong = "b".repeat(64);
 const ip = "c".repeat(64);
@@ -29,14 +31,17 @@ const update = (revision, version = 1, verifier = hash) => invoke("excalidraw_up
 
 try {
   equal((await invoke("excalidraw_get_scene", ["rooms", id, hash])).status, 403);
-  equal((await create(id)).status, 201);
+  const created = await create(id);
+  equal(created.status, 201);
+  equal(created.writeAck, { revision: 1, sceneVersion: 1 });
+  equal(created.record, undefined);
   equal((await create(id, wrong)).status, 403);
   const original = await create(id);
   equal(original.status, 409);
   equal(original.record.revision, 1);
   equal((await invoke("excalidraw_get_scene", ["rooms", id, wrong])).status, 403);
   equal((await update(1, 99, wrong)).status, 403);
-  equal((await update(1, 0)).record.revision, 2); // Lower sceneVersion still valid CAS.
+  equal((await update(1, 0)).writeAck.revision, 2); // Lower sceneVersion still valid CAS.
   const stale = await update(1);
   equal(stale.status, 409);
   equal(stale.record.revision, 2);

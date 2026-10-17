@@ -30,6 +30,32 @@ const emptySave = async () => ({
 });
 
 describe("cloud file room isolation", () => {
+  it("does not invoke cloud saves for empty or already saved image batches", async () => {
+    const saveFiles = vi.fn(async ({ addedFiles }) => ({
+      savedFiles: addedFiles,
+      erroredFiles: new Map(),
+    }));
+    const manager = new FileManager({
+      getFiles: async () => ({ loadedFiles: [], erroredFiles: new Map() }),
+      saveFiles,
+    });
+    await manager.saveFiles({ elements: [], files: {} });
+    await manager.saveFiles({
+      elements: [{ type: "rectangle" } as ExcalidrawElement],
+      files: {},
+    });
+    expect(saveFiles).not.toHaveBeenCalled();
+    await manager.saveFiles({
+      elements: [element],
+      files: { [file.id]: file },
+    });
+    await manager.saveFiles({
+      elements: [element],
+      files: { [file.id]: file },
+    });
+    expect(saveFiles).toHaveBeenCalledTimes(1);
+  });
+
   it("does not publish an old room's fetched files or status after reset", async () => {
     const pending = deferred<{
       loadedFiles: BinaryFileData[];
